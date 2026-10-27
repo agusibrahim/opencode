@@ -10,7 +10,6 @@ import { GoogleImages } from "../protocols/google-images.js"
 import { GoogleSpeech } from "../protocols/google-speech.js"
 import { GoogleTranscription } from "../protocols/google-transcription.js"
 import { GoogleVideo } from "../protocols/google-video.js"
-import { toConfig } from "./settings.js"
 
 export type { GoogleImageOptions } from "../protocols/google-images.js"
 export type { GoogleSpeechOptions } from "../protocols/google-speech.js"
@@ -33,11 +32,19 @@ export type Config = RouteDefaultsInput &
 export type Settings = ProviderPackage.Settings &
   Gemini.ProviderOptionsInput & {
     readonly apiKey?: string | false
+    readonly auth?: Auth.Definition
     readonly baseURL?: string
   }
 
-const auth = (options: ProviderAuthOption<"optional">) =>
-  AuthOptions.apiKey(options, "GOOGLE_GENERATIVE_AI_API_KEY", Auth.header("x-goog-api-key"))
+const hasAuthorizationHeader = (headers: Readonly<Record<string, string>> | undefined) =>
+  headers !== undefined && Object.keys(headers).some((key) => key.toLowerCase() === "authorization")
+
+const auth = (options: Config) => {
+  // A caller-supplied Authorization header (e.g. the Google AAS credential) is authoritative: it selects
+  // the bearer path, where the route's default headers carry the token and no credential lookup happens.
+  if (hasAuthorizationHeader(options.headers)) return Auth.none
+  return AuthOptions.apiKey(options, "GOOGLE_GENERATIVE_AI_API_KEY", Auth.header("x-goog-api-key"))
+}
 
 const configuredRoute = (input: Config) => {
   const { apiKey: _, auth: _auth, baseURL, ...rest } = input
@@ -70,10 +77,22 @@ export const configure = (input: Config = {}) => {
 
 export const provider = configure()
 export const model: ProviderPackage.Model<Settings, Gemini.ProviderOptionsInput> = (modelID, settings) =>
-  configure(toConfig(settings)).model(modelID)
+  configure(config(settings)).model(modelID)
 export const imageModel = (modelID: string, settings?: Settings) => {
-  const input = toConfig(settings)
+  const input = config(settings)
   return configure(input).image(modelID, input.providerOptions)
+}
+
+/**
+ * Shapes the package's settings into a `Config`. The route auth option is a
+ * union, so an explicit `auth` definition (e.g. the model resolver's bearer
+ * credential for AAS) excludes the `apiKey` field it would otherwise shadow.
+ */
+export function config(settings?: Settings): Config {
+  const { auth, apiKey, baseURL, body, headers, ...providerOptions } = settings ?? {}
+  const http = body === undefined ? undefined : { body }
+  if (auth) return { auth, baseURL, headers, http, providerOptions }
+  return { apiKey, baseURL, headers, http, providerOptions }
 }
 
 export const image = provider.image
