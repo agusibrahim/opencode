@@ -18,6 +18,7 @@ import { Credential } from "./credential.js"
 import { Integration } from "./integration.js"
 import { Capabilities, ID, Info, Model, Ref, VariantID } from "./model.js"
 import type { RuntimeInfo } from "./model.js"
+import { AAS_METADATA } from "./plugin/provider/google.js"
 import { Npm } from "@opencode/util/npm"
 import { Provider } from "./provider.js"
 
@@ -379,7 +380,18 @@ function unresolvedProviderVariables(model: RuntimeInfo, baseURL: string) {
 const nativeCredentialSettings = (model: RuntimeInfo, specifier: string, credential: Credential.Value | undefined) => {
   if (!credential) return {}
   if (credential.type === "key") return { apiKey: credential.key }
-  if (credential.type === "oauth") return tokenSettings(specifier, credential.access)
+  if (credential.type === "oauth") {
+    // The Google AAS plugin mints Gemini OAuth access tokens the API accepts only as an
+    // `Authorization: Bearer`; the package's default resolution would post it as an
+    // `x-goog-api-key` key and the API answers `API_KEY_INVALID`. The credential's metadata
+    // flag selects the bearer path for every google package entrypoint.
+    if (
+      (specifier.startsWith("@opencode/ai/providers/google/") || specifier === "@opencode/ai/providers/google") &&
+      credential.metadata?.[AAS_METADATA] === true
+    )
+      return { auth: Auth.bearer(credential.access) }
+    return tokenSettings(specifier, credential.access)
+  }
   // The saved profile reaches the package through metadata; SigV4 keeps an ambient bearer token from taking over.
   if (specifier.startsWith("@opencode/ai/providers/amazon-bedrock")) return { auth: "sigv4" }
   // The Azure plugin's request hooks replace this with an Entra ID token from the Azure CLI; it only gets the

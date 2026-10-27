@@ -32,11 +32,20 @@ export type Config = RouteDefaultsInput &
 export type Settings = ProviderPackage.Settings &
   Gemini.ProviderOptionsInput & {
     readonly apiKey?: string
+    readonly auth?: Auth.Definition
     readonly baseURL?: string
   }
 
-const auth = (options: ProviderAuthOption<"optional">) => {
+const hasAuthorizationHeader = (headers: Readonly<Record<string, string>> | undefined) =>
+  headers !== undefined && Object.keys(headers).some((key) => key.toLowerCase() === "authorization")
+
+const auth = (options: ProviderAuthOption<"optional"> | { headers?: Readonly<Record<string, string>> }) => {
   if ("auth" in options && options.auth) return options.auth
+  // The API accepts OAuth access tokens only as `Authorization: Bearer <token>`; sending one as
+  // `x-goog-api-key` fails with `API_KEY_INVALID` even though a real Gemini API key works there.
+  // A caller-supplied Authorization header (e.g. the Google AAS credential) selects the bearer
+  // path, where the route's default headers carry the token and no credential lookup happens.
+  if (hasAuthorizationHeader("headers" in options ? options.headers : undefined)) return Auth.none
   return Auth.optional("apiKey" in options ? options.apiKey : undefined, "apiKey")
     .orElse(Auth.config("GOOGLE_GENERATIVE_AI_API_KEY"))
     .pipe(Auth.header("x-goog-api-key"))
@@ -77,14 +86,16 @@ export const imageModel = (modelID: string, settings: Settings) => {
   return configure(input).image(modelID, input.providerOptions)
 }
 
-function config({ apiKey, baseURL, body, headers, ...providerOptions }: Settings) {
-  return {
-    apiKey,
-    baseURL,
-    headers,
-    http: body === undefined ? undefined : { body },
-    providerOptions,
-  }
+/**
+ * Shapes the package's settings into a `Config`. The route auth option is a
+ * union, so an explicit `auth` definition (e.g. the model resolver's bearer
+ * credential for AAS) excludes the `apiKey` field it would otherwise shadow.
+ */
+export function config(settings: Settings): Config {
+  const { apiKey, auth, baseURL, body, headers, ...providerOptions } = settings
+  const http = body === undefined ? undefined : { body }
+  if (auth) return { auth, baseURL, headers, http, providerOptions }
+  return { apiKey, baseURL, headers, http, providerOptions }
 }
 
 export const image = provider.image
