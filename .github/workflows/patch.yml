@@ -1,0 +1,55 @@
+name: patch
+
+on:
+  push:
+    branches: [dev]
+  pull_request:
+  workflow_dispatch:
+
+jobs:
+  # The fork tree carries the change baked in; typecheck it and run the patch's tests.
+  tree:
+    name: typecheck and test this tree
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.3
+      - name: install
+        run: bun install --ignore-scripts
+      - name: typecheck
+        run: bun run typecheck
+      - name: patch tests
+        run: |
+          cd packages/core
+          bun test test/plugin/provider-google-aas.test.ts test/model-resolver.test.ts
+          cd ../packages/ai
+          bun test test/auth.test.ts
+
+  # Prove the patch still merges into a clean checkout of latest upstream sst/opencode,
+  # and that the merged result typechecks and tests green. A conflict here is the
+  # signal to rework the patch against what upstream did.
+  upstream:
+    name: patch applies to latest upstream
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: 1.3.3
+      - name: clone latest upstream dev
+        run: git clone --depth 1 --branch dev https://github.com/sst/opencode.git "$RUNNER_TEMP/upstream"
+      - name: apply patch to the clean checkout
+        run: OC_REPO="$RUNNER_TEMP/upstream" bash patches/google-aas/apply.sh
+      - name: install deps in the merged tree
+        run: cd "$RUNNER_TEMP/upstream" && bun install --ignore-scripts
+      - name: typecheck the merged tree
+        run: |
+          cd "$RUNNER_TEMP/upstream"
+          node_modules/.bin/tsc -b packages/core/tsconfig.json packages/core/tsconfig.tests.json
+          node_modules/.bin/tsc -b packages/ai/tsconfig.json
+      - name: run the patch tests on the merged tree
+        run: cd "$RUNNER_TEMP/upstream/packages/core" && bun test test/plugin/provider-google-aas.test.ts

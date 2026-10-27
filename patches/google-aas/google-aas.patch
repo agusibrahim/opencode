@@ -1,0 +1,677 @@
+diff --git a/packages/ai/src/providers/google.ts b/packages/ai/src/providers/google.ts
+index 63d2b94deb..2933e6d72c 100644
+--- a/packages/ai/src/providers/google.ts
++++ b/packages/ai/src/providers/google.ts
+@@ -32,11 +32,20 @@ export type Config = RouteDefaultsInput &
+ export type Settings = ProviderPackage.Settings &
+   Gemini.ProviderOptionsInput & {
+     readonly apiKey?: string
++    readonly auth?: Auth.Definition
+     readonly baseURL?: string
+   }
+ 
+-const auth = (options: ProviderAuthOption<"optional">) => {
++const hasAuthorizationHeader = (headers: Readonly<Record<string, string>> | undefined) =>
++  headers !== undefined && Object.keys(headers).some((key) => key.toLowerCase() === "authorization")
++
++const auth = (options: ProviderAuthOption<"optional"> | { headers?: Readonly<Record<string, string>> }) => {
+   if ("auth" in options && options.auth) return options.auth
++  // The API accepts OAuth access tokens only as `Authorization: Bearer <token>`; sending one as
++  // `x-goog-api-key` fails with `API_KEY_INVALID` even though a real Gemini API key works there.
++  // A caller-supplied Authorization header (e.g. the Google AAS credential) selects the bearer
++  // path, where the route's default headers carry the token and no credential lookup happens.
++  if (hasAuthorizationHeader("headers" in options ? options.headers : undefined)) return Auth.none
+   return Auth.optional("apiKey" in options ? options.apiKey : undefined, "apiKey")
+     .orElse(Auth.config("GOOGLE_GENERATIVE_AI_API_KEY"))
+     .pipe(Auth.header("x-goog-api-key"))
+@@ -77,14 +86,16 @@ export const imageModel = (modelID: string, settings: Settings) => {
+   return configure(input).image(modelID, input.providerOptions)
+ }
+ 
+-function config({ apiKey, baseURL, body, headers, ...providerOptions }: Settings) {
+-  return {
+-    apiKey,
+-    baseURL,
+-    headers,
+-    http: body === undefined ? undefined : { body },
+-    providerOptions,
+-  }
++/**
++ * Shapes the package's settings into a `Config`. The route auth option is a
++ * union, so an explicit `auth` definition (e.g. the model resolver's bearer
++ * credential for AAS) excludes the `apiKey` field it would otherwise shadow.
++ */
++export function config(settings: Settings): Config {
++  const { apiKey, auth, baseURL, body, headers, ...providerOptions } = settings
++  const http = body === undefined ? undefined : { body }
++  if (auth) return { auth, baseURL, headers, http, providerOptions }
++  return { apiKey, baseURL, headers, http, providerOptions }
+ }
+ 
+ export const image = provider.image
+diff --git a/packages/ai/src/providers/google/interactions.ts b/packages/ai/src/providers/google/interactions.ts
+index 679ffa4752..dae67e063e 100644
+--- a/packages/ai/src/providers/google/interactions.ts
++++ b/packages/ai/src/providers/google/interactions.ts
+@@ -1,21 +1,16 @@
+-import { configure } from "../google.js"
++import type { Auth } from "../../route/auth.js"
++import { configure, config } from "../google.js"
+ import type { ProviderPackage } from "../../provider-package.js"
+ import type { GoogleInteractions } from "../../protocols/google-interactions.js"
+ 
+ export type Settings = ProviderPackage.Settings &
+   GoogleInteractions.ProviderOptionsInput & {
+     readonly apiKey?: string
++    readonly auth?: Auth.Definition
+     readonly baseURL?: string
+   }
+ 
+ export const model: ProviderPackage.Definition<Settings, GoogleInteractions.ProviderOptionsInput>["model"] = (
+   modelID,
+-  { apiKey, baseURL, body, headers, ...providerOptions },
+-) =>
+-  configure({
+-    apiKey,
+-    baseURL,
+-    headers,
+-    http: body === undefined ? undefined : { body },
+-    providerOptions,
+-  }).interactions(modelID)
++  settings,
++) => configure(config(settings)).interactions(modelID)
+diff --git a/packages/core/src/model-resolver.ts b/packages/core/src/model-resolver.ts
+index 1bf02798fd..6bfc57d8c0 100644
+--- a/packages/core/src/model-resolver.ts
++++ b/packages/core/src/model-resolver.ts
+@@ -18,6 +18,7 @@ import { Credential } from "./credential.js"
+ import { Integration } from "./integration.js"
+ import { Capabilities, ID, Info, Model, Ref, VariantID } from "./model.js"
+ import type { RuntimeInfo } from "./model.js"
++import { AAS_METADATA } from "./plugin/provider/google.js"
+ import { Npm } from "@opencode/util/npm"
+ import { Provider } from "./provider.js"
+ 
+@@ -379,7 +380,18 @@ function unresolvedProviderVariables(model: RuntimeInfo, baseURL: string) {
+ const nativeCredentialSettings = (model: RuntimeInfo, specifier: string, credential: Credential.Value | undefined) => {
+   if (!credential) return {}
+   if (credential.type === "key") return { apiKey: credential.key }
+-  if (credential.type === "oauth") return tokenSettings(specifier, credential.access)
++  if (credential.type === "oauth") {
++    // The Google AAS plugin mints Gemini OAuth access tokens the API accepts only as an
++    // `Authorization: Bearer`; the package's default resolution would post it as an
++    // `x-goog-api-key` key and the API answers `API_KEY_INVALID`. The credential's metadata
++    // flag selects the bearer path for every google package entrypoint.
++    if (
++      (specifier.startsWith("@opencode/ai/providers/google/") || specifier === "@opencode/ai/providers/google") &&
++      credential.metadata?.[AAS_METADATA] === true
++    )
++      return { auth: Auth.bearer(credential.access) }
++    return tokenSettings(specifier, credential.access)
++  }
+   // The saved profile reaches the package through metadata; SigV4 keeps an ambient bearer token from taking over.
+   if (specifier.startsWith("@opencode/ai/providers/amazon-bedrock")) return { auth: "sigv4" }
+   // The Azure plugin's request hooks replace this with an Entra ID token from the Azure CLI; it only gets the
+diff --git a/packages/core/src/plugin/provider.ts b/packages/core/src/plugin/provider.ts
+index 5fbc6796af..4dffa5b77c 100644
+--- a/packages/core/src/plugin/provider.ts
++++ b/packages/core/src/plugin/provider.ts
+@@ -10,6 +10,7 @@ import { DigitalOceanPlugin } from "./provider/digitalocean.js"
+ import { DynamicProviderPlugin } from "./provider/dynamic.js"
+ import { GithubCopilotPlugin } from "./provider/github-copilot.js"
+ import { GitLabPlugin } from "./provider/gitlab.js"
++import { GooglePlugin } from "./provider/google.js"
+ import { GoogleVertexPlugin } from "./provider/google-vertex.js"
+ import { KiloPlugin } from "./provider/kilo.js"
+ import { LLMGatewayPlugin } from "./provider/llmgateway.js"
+@@ -45,6 +46,7 @@ export const ProviderPlugins: PluginInternal.InternalPlugin[] = [
+   DigitalOceanPlugin,
+   GithubCopilotPlugin,
+   GitLabPlugin,
++  GooglePlugin,
+   GoogleVertexPlugin,
+   KiloPlugin,
+   LLMGatewayPlugin,
+diff --git a/packages/core/src/plugin/provider/google.ts b/packages/core/src/plugin/provider/google.ts
+new file mode 100644
+index 0000000000..a0821e9219
+--- /dev/null
++++ b/packages/core/src/plugin/provider/google.ts
+@@ -0,0 +1,259 @@
++import type { IntegrationOAuthMethodRegistration } from "@opencode/plugin/effect/integration"
++import { define } from "@opencode/plugin/effect/plugin"
++import { Effect } from "effect"
++import type { PluginInternal } from "../internal.js"
++import { Credential } from "../../credential.js"
++import { Integration } from "../../integration.js"
++
++/**
++ * Google Gemini (Generative Language API) Android AAS auth.
++ *
++ * The Gemini Developer API accepts OAuth access tokens only as
++ * `Authorization: Bearer <token>`; an OAuth token sent as `x-goog-api-key` is
++ * rejected with `API_KEY_INVALID`. The credential stores the Android auth
++ * service (AAS) master token as the canonical `refresh` value and renewal
++ * re-runs the master-token exchange, because the short-lived `ya29...` access
++ * token it mints outlives faster than the master token.
++ */
++
++const tokenURL = "https://android.googleapis.com/auth"
++const userAgent = "GoogleAuth/1.4"
++/** Google Play services identity the AAS exchange is performed as. */
++const app = "com.google.android.googlequicksearchbox"
++const clientSig = "38918a453d07199354f8b19af05ec6562ced5788"
++const deviceCountry = "id"
++const playServicesVersion = "263332035"
++const sdkVersion = "35"
++/**
++ * Scopes requested from the exchange. The Gemini API needs
++ * `generative-language`; the remaining scopes let the same master token serve
++ * the other Google APIs reachable from an Android account. AAS takes the
++ * `oauth2:` scheme marker once, on the first scope only.
++ */
++const scopes = [
++  "https://www.googleapis.com/auth/assistant",
++  "https://www.googleapis.com/auth/generative-language",
++  "https://www.googleapis.com/auth/photos.image.readonly",
++  "https://www.googleapis.com/auth/drive",
++]
++const service = `oauth2:${scopes.join(" ")}`
++/** AAS reports a 1 hour lifetime; assume a shorter one when it does not say. */
++const assumedAccessLifetime = 55 * 60 * 1000
++
++/**
++ * Metadata flag on credentials minted from an AAS master token. The model
++ * resolver reads it to hand the access token to the `google` package as a
++ * bearer credential, because the package's default OAuth path posts the
++ * token as `x-goog-api-key` and the API answers `API_KEY_INVALID`.
++ */
++export const AAS_METADATA = "aas:true"
++
++const googleIntegration = Integration.ID.make("google")
++const methodID = Integration.MethodID.make("aas")
++
++export interface Master {
++  androidId?: string
++  Email?: string
++  token: string
++}
++
++const readString = (value: unknown) => {
++  if (typeof value !== "string") return undefined
++  const trimmed = value.trim().replace(/^'+|'+$/g, "").trim()
++  return trimmed ? trimmed : undefined
++}
++
++/**
++ * Accept either a bare master token or the `androidId`/`Email`/`Token` query
++ * string Google and Android tooling store alongside it.
++ */
++export function parseMaster(input: string): Master {
++  const trimmed = input.trim().replace(/^"+|"+$/g, "").trim()
++  const unescaped = (() => {
++    try {
++      return decodeURIComponent(trimmed)
++    } catch {
++      return trimmed
++    }
++  })()
++
++  if (unescaped.startsWith("aas_et/")) return { token: unescaped }
++
++  const query = new URLSearchParams(unescaped)
++  const token = readString(query.get("Token")) ?? readString(query.get("token"))
++  if (token)
++    return {
++      token,
++      androidId: readString(query.get("androidId")),
++      Email: readString(query.get("Email")),
++    }
++
++  const marker = trimmed.indexOf("aas_et")
++  if (marker >= 0) return { token: unescaped.slice(marker) }
++
++  throw new Error("No AAS master token found. Paste aas_et/... or androidId=...&Email=...&Token=...")
++}
++
++/**
++ * AAS answers with a `key=value` block separated by spaces, commas and
++ * semicolons, with quoted values and space-containing lists such as
++ * `grantedScopes`. Unkeyed tokens continue the previous value.
++ */
++export function parseResponse(body: string) {
++  const fields = new Map<string, string>()
++  let lastKey: string | undefined
++  for (const chunk of body.split(/[\s,;]+/)) {
++    const token = chunk.replace(/^'+|'+$/g, "")
++    if (!token) continue
++    const separator = token.indexOf("=")
++    if (separator > 0) {
++      const key = token.slice(0, separator)
++      const value = token.slice(separator + 1)
++      fields.set(key, fields.has(key) ? `${fields.get(key)},${value}` : value)
++      lastKey = key
++    } else if (lastKey) {
++      fields.set(lastKey, `${fields.get(lastKey)} ${token}`)
++    }
++  }
++  return fields
++}
++
++function readExpiry(fields: Map<string, string>) {
++  const expiry = Number(fields.get("Expiry"))
++  if (Number.isFinite(expiry) && expiry > 0) return expiry * 1000
++  const duration = Number(fields.get("ExpiresInDurationSec"))
++  if (Number.isFinite(duration) && duration > 0) return Date.now() + duration * 1000
++  return Date.now() + assumedAccessLifetime
++}
++
++/** Exchanges an AAS master token for a short-lived OAuth access token. */
++export const exchange = Effect.fn("GooglePlugin.exchange")(function* (master: Master, email?: string) {
++  const response = yield* Effect.tryPromise({
++    try: async () =>
++      await fetch(tokenURL, {
++        method: "POST",
++        headers: {
++          "Content-Type": "application/x-www-form-urlencoded",
++          "User-Agent": userAgent,
++        },
++        body: new URLSearchParams({
++          Token: master.token,
++          Email: master.Email ?? email ?? "",
++          service,
++          app,
++          callerPkg: app,
++          client_sig: clientSig,
++          callerSig: clientSig,
++          source: "android",
++          device_country: deviceCountry,
++          lang: "en_US",
++          sdk_version: sdkVersion,
++          google_play_services_version: playServicesVersion,
++          ...(master.androidId ? { androidId: master.androidId } : {}),
++        }),
++      }),
++    catch: (cause) => new Error(`Google AAS token exchange request failed: ${String(cause)}`),
++  })
++  const text = yield* Effect.tryPromise({
++    try: () => response.text().catch(() => ""),
++    catch: (cause) => new Error(`Google AAS token exchange failed: ${String(cause)}`),
++  })
++  if (!response.ok)
++    throw new Error(`Google AAS token exchange failed (${String(response.status)}): ${text.slice(0, 400)}`)
++
++  const fields = parseResponse(text)
++  const failure = readString(fields.get("Error"))
++  if (failure) throw new Error(`Google AAS token exchange rejected the master token: ${failure}`)
++
++  const access = readString(fields.get("Auth"))
++  if (!access) throw new Error(`Google AAS token exchange returned no Auth value: ${text.slice(0, 400)}`)
++
++  // The AAS master token is what renews the access token, so it occupies the canonical `refresh` slot.
++  return Credential.OAuth.make({
++    type: "oauth",
++    methodID,
++    refresh: master.token,
++    access,
++    expires: readExpiry(fields),
++    metadata: {
++      [AAS_METADATA]: true,
++      ...(email ? { aas_email: email } : {}),
++      ...(master.androidId ? { aas_android_id: master.androidId } : {}),
++    },
++  })
++})
++
++const masterFromCredential = Effect.fn("GooglePlugin.masterFromCredential")(function* (credential: Credential.OAuth) {
++  const token = readString(credential.refresh)
++  if (!token)
++    return yield* Effect.fail(
++      new Error("Google AAS credential cannot renew itself. Log in again to enter a new AAS token."),
++    )
++  const metadata = credential.metadata
++  return {
++    token,
++    androidId: readString(metadata?.aas_android_id),
++    Email: readString(metadata?.aas_email),
++  }
++})
++
++const oauth = (): IntegrationOAuthMethodRegistration => ({
++  integrationID: googleIntegration,
++  method: {
++    id: "aas",
++    type: "oauth",
++    label: "Google Gemini (Android AAS)",
++    form: [
++      {
++        type: "string",
++        key: "email",
++        title: "Google account email for the AAS token",
++        description:
++          "Optional when the pasted auth string already includes Email=...; the AAS exchange cross-checks the account, so a bare aas_et token needs it",
++        format: "email",
++        placeholder: "you@gmail.com",
++      },
++    ],
++  },
++  authorize: (answer) => {
++    const email = readString(answer.email)
++    return Effect.succeed({
++      mode: "code" as const,
++      // No provider-hosted page grants the AAS master token; it lives on the
++      // device that ran the Android auth flow, so there is no URL to open.
++      url: "",
++      instructions:
++        "Paste the Google AAS master token when prompted: aas_et/... or the full androidId=...&Email=...&Token=... auth string it belongs to",
++      callback: (code: string) =>
++        Effect.gen(function* () {
++          let master: Master
++          try {
++            master = parseMaster(code)
++          } catch (cause) {
++            return yield* Effect.fail(cause)
++          }
++          const address = readString(master.Email) ?? email
++          if (!address) return yield* Effect.fail(new Error("Missing Google account email for the AAS master token"))
++          return yield* exchange(master, address)
++        }),
++    })
++  },
++  refresh: (credential) =>
++    Effect.gen(function* () {
++      const master = yield* masterFromCredential(credential)
++      return yield* exchange(master, master.Email)
++    }),
++  label: (credential) => {
++    const email = readString(credential.metadata?.aas_email)
++    return email ? `Google AAS (${email})` : undefined
++  },
++})
++
++export const GooglePlugin = define({
++  id: "opencode.provider.google.aas",
++  effect: Effect.fn(function* (ctx) {
++    yield* ctx.integration.transform((editor) => {
++      editor.method.update(oauth())
++    })
++  }),
++} satisfies PluginInternal.InternalPlugin)
+diff --git a/packages/core/test/plugin/provider-google-aas.test.ts b/packages/core/test/plugin/provider-google-aas.test.ts
+new file mode 100644
+index 0000000000..3704425d24
+--- /dev/null
++++ b/packages/core/test/plugin/provider-google-aas.test.ts
+@@ -0,0 +1,272 @@
++import { describe, expect } from "bun:test"
++import { Cause, Effect, Exit, Option } from "effect"
++import { Headers } from "effect/http"
++import { LLM } from "@opencode/ai/effect"
++import { Credential } from "@opencode/core/credential"
++import { Integration } from "@opencode/core/integration"
++import { ID, Info, Model } from "@opencode/core/model"
++import { ModelResolver } from "@opencode/core/model-resolver"
++import { Plugin } from "@opencode/core/plugin"
++import { PluginHost } from "@opencode/core/plugin/host"
++import { GooglePlugin } from "@opencode/core/plugin/provider/google"
++import { Provider } from "@opencode/core/provider"
++import { testEffect } from "../lib/effect"
++import { PluginTestLayer } from "./fixture"
++
++const it = testEffect(PluginTestLayer)
++
++const googleIntegration = Integration.ID.make("google")
++const aasMethod = Integration.MethodID.make("aas")
++const MASTER = "aas_et/AK99testmastertoken"
++const ACCESS_1 = "ya29.first-access"
++const ACCESS_2 = "ya29.renewed-access"
++const TOKEN_URL = "https://android.googleapis.com/auth"
++
++const aasBody = (access: string) =>
++  [
++    `SID=${crypto.randomUUID()}`,
++    `LSID=${crypto.randomUUID()}`,
++    `Auth=${access}`,
++    `Expiry=${Math.floor((Date.now() + 3_600_000) / 1000)}`,
++    "Email=me@example.com",
++    "grantedScopes=oauth2:https://www.googleapis.com/auth/generative-language",
++  ].join("\n")
++
++const withAasFetch = <A, E, R>(
++  access: string,
++  use: (state: { sent: () => { url: string; body: string } | undefined }) => Effect.Effect<A, E, R>,
++): Effect.Effect<A, E, R> =>
++  Effect.acquireUseRelease(
++    Effect.gen(function* () {
++      const original = globalThis.fetch
++      let sent: { url: string; body: string } | undefined
++      globalThis.fetch = (async (input: Parameters<typeof fetch>[0], init?: RequestInit) => {
++        const url = typeof input === "string" ? input : input instanceof Request ? input.url : String(input)
++        if (url !== TOKEN_URL) return Response.json({}, { status: 404 })
++        const body = String(init?.body ?? new URLSearchParams())
++        sent = { url, body: new URLSearchParams(body).toString() }
++        return new Response(aasBody(access), { status: 200 })
++      }) as unknown as typeof fetch
++      return {
++        release: Effect.sync(() => {
++          globalThis.fetch = original
++        }),
++        sent: () => sent,
++      }
++    }),
++    (state) => use(state),
++    (state) => state.release,
++  )
++
++const addPlugin = Effect.fn(function* () {
++  const providers = yield* Provider.Service
++  yield* providers.transform((editor) => {
++    editor.add({
++      info: {
++        ...Provider.Info.empty(Provider.ID.google),
++        name: "Google",
++        package: "@opencode/ai/providers/google",
++        activation: "enabled",
++      },
++      models: [Model.Info.default(Provider.ID.google, Model.ID.make("gemini-2.5-flash"))],
++    })
++  })
++  const plugin = yield* Plugin.Service
++  const host = yield* PluginHost.make(plugin)
++  yield* GooglePlugin.effect(host)
++})
++
++function required<T>(value: T | undefined): T {
++  if (value === undefined) throw new Error("Expected value")
++  return value
++}
++
++/** A catalog model row served by the native google package, as models.dev lists them. */
++const catalogModel = () => {
++  const info: Model.MutableInfo = {
++    id: ID.make("test-model"),
++    modelID: ID.make("gemini-2.5-flash"),
++    providerID: Provider.ID.google,
++    name: "Test model",
++    package: "@opencode/ai/providers/google",
++    settings: { baseURL: "https://generativelanguage.googleapis.com/v1beta" },
++    headers: {},
++    body: {},
++    capabilities: { tools: true, input: ["text"], output: ["text"] },
++    variants: [],
++    time: { released: 0 },
++    cost: [],
++    status: "active",
++    enabled: true,
++    limit: { context: 100, output: 20 },
++  }
++  return Info.make(info)
++}
++
++const aasCredential = (expires: number) => (access: string) =>
++  Credential.OAuth.make({
++    type: "oauth",
++    methodID: aasMethod,
++    refresh: MASTER,
++    access,
++    expires,
++    metadata: { "aas:true": true, aas_email: "me@example.com" },
++  })
++
++describe("GooglePlugin", () => {
++  it.effect("registers the Android AAS OAuth method on Google", () =>
++    Effect.gen(function* () {
++      yield* addPlugin()
++      const integrations = yield* Integration.Service
++      expect((yield* integrations.get(googleIntegration))?.methods).toContainEqual({
++        id: aasMethod,
++        type: "oauth",
++        label: "Google Gemini (Android AAS)",
++        form: expect.any(Array),
++      })
++    }),
++  )
++
++  it.effect("exchanges the pasted AAS master token for an access token", () =>
++    withAasFetch(ACCESS_1, () =>
++      Effect.gen(function* () {
++        yield* addPlugin()
++        const integrations = yield* Integration.Service
++        const attempt = yield* integrations.oauth.connect({
++          integrationID: googleIntegration,
++          methodID: aasMethod,
++          answer: { email: "me@example.com" },
++        })
++        expect(attempt.mode).toBe("code")
++        yield* integrations.oauth.complete({
++          integrationID: googleIntegration,
++          attemptID: attempt.attemptID,
++          code: MASTER,
++        })
++        const credentials = yield* Credential.Service
++        const [saved, ...rest] = yield* credentials.list(googleIntegration)
++        expect(rest).toHaveLength(0)
++        expect(saved.value).toEqual({
++          ...aasCredential(0)(ACCESS_1),
++          expires: expect.any(Number),
++        })
++      }),
++    ),
++  )
++
++  it.effect("sends the AAS exchange request with the Play services identity", () =>
++    withAasFetch(ACCESS_1, (state) =>
++      Effect.gen(function* () {
++        yield* addPlugin()
++        const credentials = yield* Credential.Service
++        yield* credentials.create({
++          integrationID: googleIntegration,
++          label: "Google AAS",
++          value: aasCredential(1)(ACCESS_1),
++        })
++        const integrations = yield* Integration.Service
++        const connection = required(yield* integrations.connection.active(googleIntegration))
++        yield* integrations.connection.resolve(connection)
++        const sent = required(state.sent())
++        const body = new URLSearchParams(sent.body)
++        expect(body.get("Token")).toBe(MASTER)
++        expect(body.get("Email")).toBe("me@example.com")
++        expect(body.get("service")).toContain("oauth2:")
++        expect(body.get("service")).toContain("generative-language")
++        expect(body.get("app")).toBe("com.google.android.googlequicksearchbox")
++        expect(body.get("client_sig")).toBe("38918a453d07199354f8b19af05ec6562ced5788")
++        expect(body.get("google_play_services_version")).toBe("263332035")
++      }),
++    ),
++  )
++
++  it.effect("renews the access token from the stored master token", () =>
++    withAasFetch(ACCESS_2, () =>
++      Effect.gen(function* () {
++        yield* addPlugin()
++        const credentials = yield* Credential.Service
++        yield* credentials.create({
++          integrationID: googleIntegration,
++          label: "Google AAS",
++          value: aasCredential(1)(ACCESS_1),
++        })
++        const integrations = yield* Integration.Service
++        const connection = required(yield* integrations.connection.active(googleIntegration))
++        const value = required(yield* integrations.connection.resolve(connection))
++        expect(value).toEqual({
++          ...aasCredential(0)(ACCESS_2),
++          expires: expect.any(Number),
++        })
++      }),
++    ),
++  )
++
++  it.effect("reports the missing account email for a bare master token", () =>
++    withAasFetch(ACCESS_1, () =>
++      Effect.gen(function* () {
++        yield* addPlugin()
++        const integrations = yield* Integration.Service
++        const attempt = yield* integrations.oauth.connect({
++          integrationID: googleIntegration,
++          methodID: aasMethod,
++        })
++        const exit = yield* Effect.exit(
++          integrations.oauth.complete({
++            integrationID: googleIntegration,
++            attemptID: attempt.attemptID,
++            code: MASTER,
++          }),
++        )
++        const cause = required(Exit.match(exit, { onFailure: (cause) => cause, onSuccess: () => undefined }))
++        const error = Option.getOrUndefined(Cause.findErrorOption(cause))
++        expect(String((error as Error | undefined)?.message ?? error)).toContain("email")
++        const credentials = yield* Credential.Service
++        expect(yield* credentials.list(googleIntegration)).toHaveLength(0)
++      }),
++    ),
++  )
++
++  it.effect("threads the AAS access token into the google package as Authorization bearer", () =>
++    withAasFetch(ACCESS_1, () =>
++      Effect.gen(function* () {
++        yield* addPlugin()
++        const resolved = yield* ModelResolver.fromCatalogModel(
++          catalogModel(),
++          aasCredential(Date.now() + 30 * 60_000)(ACCESS_1),
++        )
++        const headers = yield* resolved.route.auth.apply({
++          request: LLM.request({ model: resolved, prompt: "Hello" }),
++          method: "POST",
++          url: resolved.route.endpoint.baseURL ?? "",
++          body: "{}",
++          headers: Headers.fromInput(resolved.route.defaults.headers),
++        })
++        // OAuth access tokens are accepted only as `Authorization: Bearer`; `x-goog-api-key`
++        // answers `API_KEY_INVALID`.
++        expect(headers.authorization).toBe(`Bearer ${ACCESS_1}`)
++        expect(headers["x-goog-api-key"]).toBeUndefined()
++      }),
++    ),
++  )
++
++  it.effect("keeps the apiKey path for a plain Google API key credential", () =>
++    withAasFetch(ACCESS_1, () =>
++      Effect.gen(function* () {
++        yield* addPlugin()
++        const resolved = yield* ModelResolver.fromCatalogModel(
++          catalogModel(),
++          Credential.Key.make({ type: "key", key: "gemini-api-key" }),
++        )
++        const headers = yield* resolved.route.auth.apply({
++          request: LLM.request({ model: resolved, prompt: "Hello" }),
++          method: "POST",
++          url: resolved.route.endpoint.baseURL ?? "",
++          body: "{}",
++          headers: Headers.fromInput(resolved.route.defaults.headers),
++        })
++        expect(headers["x-goog-api-key"]).toBe("gemini-api-key")
++        expect(headers.authorization).toBeUndefined()
++      }),
++    ),
++  )
++})
