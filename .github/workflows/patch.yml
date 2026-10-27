@@ -24,12 +24,12 @@ jobs:
         run: |
           node_modules/.bin/tsc -b packages/core/tsconfig.json packages/core/tsconfig.tests.json
           node_modules/.bin/tsc -b packages/ai/tsconfig.json
-      - name: patch tests
-        run: |
-          cd packages/core
-          bun test test/plugin/provider-google-aas.test.ts test/model-resolver.test.ts
-          cd ../packages/ai
-          bun test test/auth.test.ts
+      - name: core patch tests
+        run: bun test test/plugin/provider-google-aas.test.ts test/model-resolver.test.ts
+        working-directory: packages/core
+      - name: ai auth tests
+        run: bun test test/auth.test.ts
+        working-directory: packages/ai
 
   # Prove the patch still merges into a clean checkout of latest upstream sst/opencode,
   # and that the merged result typechecks and tests green. A conflict here is the
