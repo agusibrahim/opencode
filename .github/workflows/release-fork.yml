@@ -1,0 +1,120 @@
+name: release-fork
+
+# Fork releases without anomalyco's signing/publishing infrastructure: builds
+# every CLI target, packs npm tarballs and standalone archives, and publishes
+# them as one rolling GitHub release (tag from inputs, default `aas-latest`).
+# Every push to dev refreshes that release, so stable asset URLs keep working:
+#   https://github.com/<owner>/<repo>/releases/download/aas-latest/opencode-linux-x64.tar.gz
+
+on:
+  push:
+    branches: [dev]
+  workflow_dispatch:
+    inputs:
+      version:
+        description: "Semver override (default 0.0.0-aas-<run number>)"
+        required: false
+        type: string
+      tag:
+        description: "Release tag (default aas-latest)"
+        required: false
+        type: string
+
+concurrency:
+  group: release-fork-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+defaults:
+  run:
+    shell: bash
+
+jobs:
+  build:
+    name: Build CLI and publish release
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    env:
+      OPENCODE_VERSION: ${{ inputs.version || format('0.0.0-aas-{0}', github.run_number) }}
+      TAG: ${{ inputs.tag || 'aas-latest' }}
+      BUN_COMPILE_RELEASE: bun-v1.4.4
+      OPENCODE_MODELS_SNAPSHOT: ${{ github.workspace }}/.cache/models-catalog/api.json
+      GH_TOKEN: ${{ github.token }}
+    steps:
+      - name: Check out
+        uses: actions/checkout@v4
+        with:
+          persist-credentials: false
+
+      - name: Set up bun 1.4.4
+        uses: oven-sh/setup-bun@v2
+        with:
+          bun-version: "1.4.4"
+
+      - name: Install deps
+        run: bun install --frozen-lockfile
+
+      - name: Fetch models catalog
+        run: bun packages/core/script/update-models-snapshot.ts .cache/models-catalog/api.json
+
+      - name: Build CLI (every target)
+        working-directory: packages/cli
+        run: bun run build
+
+      - name: Smoke the bundled models catalog
+        run: bun packages/cli/script/catalog-smoke.ts packages/cli/dist/cli-linux-x64/bin/opencode
+
+      - name: Pack npm tarballs and linux archives
+        working-directory: packages/cli
+        run: bun run pack
+
+      # pack() archives only the linux targets; darwin and windows get the same
+      # naming here so every platform has one canonical download.
+      - name: Archive the darwin and windows binaries
+        run: |
+          set -euo pipefail
+          for dir in packages/cli/dist/cli-*/bin; do
+            target="$(basename "$(dirname "$dir")" | sed 's/^cli-//')"
+            case "$target" in
+              windows-*)
+                (cd "$dir" && zip -X -q -j "$GITHUB_WORKSPACE/dist/archives/opencode-$target.zip" opencode.exe)
+                ;;
+              darwin-*)
+                tar --mtime=@0 --owner=0 --group=0 --numeric-owner \
+                  -czf "dist/archives/opencode-$target.tar.gz" -C "$dir" opencode
+                ;;
+            esac
+          done
+          ls -la dist/archives
+
+      - name: Publish release
+        run: |
+          set -euo pipefail
+          cat > "$RUNNER_TEMP/notes.md" <<'EOF'
+          opencode fork build with the Google Android AAS sign-in patch baked in.
+
+          Sign in: pick the provider `google` method "Google Gemini (Android AAS)" and paste
+          `aas_et/...`, or the whole `androidId=...&Email=...&Token=...` string it came with.
+          The master token is stored as the refresh slot and re-mints access tokens itself.
+
+          Assets:
+          - `opencode-<platform>-<arch>[-musl][-baseline](.tar.gz|.zip)` — standalone CLI binaries
+          - `dist/npm/*.tgz` — npm packages (`opencode-cli-*` plus the umbrella `opencode-cli`)
+
+          macOS and Windows binaries are unsigned: after unpacking run `xattr -cr opencode` on
+          macOS, or confirm the SmartScreen prompt on Windows.
+          Stable asset URLs (`.../releases/download/aas-latest/opencode-linux-x64.tar.gz`) keep
+          working because every push to dev rewrote the same release.
+          EOF
+
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release delete "$TAG" --yes --cleanup-tag
+          fi
+          gh release create "$TAG" \
+            --target "$GITHUB_SHA" \
+            --title "opencode with Google AAS ($OPENCODE_VERSION)" \
+            --notes-file "$RUNNER_TEMP/notes.md" \
+            "$GITHUB_WORKSPACE/dist/archives/"* \
+            "$GITHUB_WORKSPACE/dist/npm/"*
