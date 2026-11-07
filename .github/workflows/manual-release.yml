@@ -1,0 +1,72 @@
+name: "Manual: Build & Publish Release"
+
+# Manual entry point for building and publishing patched opencode binaries for
+# specific platforms (Linux, macOS, Windows) without building all 12 targets.
+
+on:
+  workflow_dispatch:
+    inputs:
+      linux:
+        description: "Build Linux targets (x64, arm64, musl, baseline)"
+        required: false
+        type: boolean
+        default: true
+      mac:
+        description: "Build macOS targets (darwin-arm64, darwin-x64, baseline)"
+        required: false
+        type: boolean
+        default: true
+      windows:
+        description: "Build Windows targets (windows-x64, windows-arm64, baseline)"
+        required: false
+        type: boolean
+        default: false
+      version:
+        description: "Semver override (defaults to packages/cli/package.json version)"
+        required: false
+        type: string
+      tag:
+        description: "Release tag (default aas-latest)"
+        required: false
+        type: string
+
+permissions:
+  actions: write
+  contents: read
+
+jobs:
+  dispatch:
+    name: Dispatch release-fork build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Trigger release-fork.yml
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+          TARGET_WORKFLOW: release-fork.yml
+          TARGET_REF: ${{ github.ref_name }}
+          LINUX: ${{ inputs.linux }}
+          MAC: ${{ inputs.mac }}
+          WINDOWS: ${{ inputs.windows }}
+          VERSION: ${{ inputs.version }}
+          TAG: ${{ inputs.tag || 'aas-latest' }}
+        run: |
+          set -euo pipefail
+
+          args=(
+            --ref "${TARGET_REF}"
+            -f "linux=${LINUX}"
+            -f "mac=${MAC}"
+            -f "windows=${WINDOWS}"
+            -f "tag=${TAG}"
+          )
+          if [ -n "${VERSION}" ]; then
+            args+=(-f "version=${VERSION}")
+          fi
+
+          echo "dispatching ${TARGET_WORKFLOW} (ref=${TARGET_REF}, linux=${LINUX}, mac=${MAC}, windows=${WINDOWS}, tag=${TAG})"
+          gh workflow run "${TARGET_WORKFLOW}" "${args[@]}"
+
+          sleep 5
+          gh run list --workflow "${TARGET_WORKFLOW}" --limit 1 \
+            --json databaseId,status,event,url -q '.[] | "run \(.databaseId) \(.event) \(.status)\n\(.url)"'

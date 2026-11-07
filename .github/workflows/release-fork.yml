@@ -1,16 +1,30 @@
 name: release-fork
 
 # Fork releases without anomalyco's signing/publishing infrastructure: builds
-# every CLI target, packs npm tarballs and standalone archives, and publishes
+# the selected CLI targets (all by default on push; toggled via linux/mac/windows
+# on manual dispatch), packs npm tarballs and standalone archives, and publishes
 # them as one rolling GitHub release (tag from inputs, default `aas-latest`).
-# Every push to dev refreshes that release, so stable asset URLs keep working:
-#   https://github.com/<owner>/<repo>/releases/download/aas-latest/opencode-linux-x64.tar.gz
 
 on:
   push:
     branches: [dev]
   workflow_dispatch:
     inputs:
+      linux:
+        description: "Build Linux targets (x64, arm64, musl, baseline)"
+        required: false
+        type: boolean
+        default: true
+      mac:
+        description: "Build macOS targets (darwin-arm64, darwin-x64, baseline)"
+        required: false
+        type: boolean
+        default: true
+      windows:
+        description: "Build Windows targets (windows-x64, windows-arm64, baseline)"
+        required: false
+        type: boolean
+        default: false
       version:
         description: "Semver override (defaults to packages/cli/package.json version)"
         required: false
@@ -52,13 +66,30 @@ jobs:
         with:
           bun-version: "1.4.4"
 
-      - name: Resolve version
+      - name: Resolve version and selected platforms
         run: |
+          set -euo pipefail
           version="${{ inputs.version }}"
           if [ -z "$version" ]; then
             version="$(bun -e 'console.log((await Bun.file("packages/cli/package.json").json()).version)')"
           fi
           echo "OPENCODE_VERSION=$version" >> "$GITHUB_ENV"
+
+          if [ "${{ github.event_name }}" = "workflow_dispatch" ]; then
+            os_list=()
+            [ "${{ inputs.linux }}" = "true" ] && os_list+=("linux")
+            [ "${{ inputs.mac }}" = "true" ] && os_list+=("darwin")
+            [ "${{ inputs.windows }}" = "true" ] && os_list+=("win32")
+            if [ "${#os_list[@]}" -eq 0 ]; then
+              echo "::error::Select at least one platform (linux, mac, or windows)"
+              exit 1
+            fi
+            joined="$(IFS=,; echo "${os_list[*]}")"
+          else
+            joined="linux,darwin,win32"
+          fi
+          echo "OPENCODE_OS_LIST=$joined" >> "$GITHUB_ENV"
+          echo "Building version $version for OS list: $joined"
 
       - name: Install deps
         run: bun install --frozen-lockfile
@@ -66,12 +97,31 @@ jobs:
       - name: Fetch models catalog
         run: bun packages/core/script/update-models-snapshot.ts .cache/models-catalog/api.json
 
-      - name: Build CLI (every target)
+      - name: Filter CLI build targets to selected platforms
+        run: |
+          bun -e '
+            const file = "packages/cli/script/build.ts";
+            const src = await Bun.file(file).text();
+            const needle = "      : allTargets\n";
+            if (!src.includes(needle)) throw new Error("Could not locate allTargets fallback in packages/cli/script/build.ts");
+            const replacement = "      : allTargets.filter((item) => (process.env.OPENCODE_OS_LIST ?? \"linux,darwin,win32\").split(\",\").includes(item.os))\n";
+            await Bun.write(file, src.replace(needle, replacement));
+          '
+
+      - name: Build CLI (selected targets)
         working-directory: packages/cli
         run: bun run build
 
+      - name: Restore build.ts
+        run: git checkout -- packages/cli/script/build.ts
+
       - name: Smoke the bundled models catalog
-        run: bun packages/cli/script/catalog-smoke.ts packages/cli/dist/cli-linux-x64/bin/opencode
+        run: |
+          if [ -f packages/cli/dist/cli-linux-x64/bin/opencode ]; then
+            bun packages/cli/script/catalog-smoke.ts packages/cli/dist/cli-linux-x64/bin/opencode
+          else
+            echo "linux-x64 was not selected in this build; skipping Linux host binary execution smoke test"
+          fi
 
       - name: Pack npm tarballs and linux archives
         working-directory: packages/cli
@@ -82,6 +132,7 @@ jobs:
       - name: Archive the darwin and windows binaries
         run: |
           set -euo pipefail
+          shopt -s nullglob
           for dir in packages/cli/dist/cli-*/bin; do
             target="$(basename "$(dirname "$dir")" | sed 's/^cli-//')"
             case "$target" in
@@ -99,29 +150,37 @@ jobs:
       - name: Publish release
         run: |
           set -euo pipefail
-          cat > "$RUNNER_TEMP/notes.md" <<'EOF'
+          cat > "$RUNNER_TEMP/notes.md" <<EOF
           opencode fork build with the Google Android AAS sign-in patch baked in.
 
-          Sign in: pick the provider `google` method "Google Gemini (Android AAS)" and paste
-          `aas_et/...`, or the whole `androidId=...&Email=...&Token=...` string it came with.
+          - version: \`$OPENCODE_VERSION\`
+          - commit: \`$GITHUB_SHA\`
+          - built platforms in this run: \`$OPENCODE_OS_LIST\`
+
+          Sign in: pick the provider \`google\` method "Google Gemini (Android AAS)" and paste
+          \`aas_et/...\`, or the whole \`androidId=...&Email=...&Token=...\` string it came with.
           The master token is stored as the refresh slot and re-mints access tokens itself.
 
           Assets:
-          - `opencode-<platform>-<arch>[-musl][-baseline](.tar.gz|.zip)` — standalone CLI binaries
-          - `dist/npm/*.tgz` — npm packages (`opencode-cli-*` plus the umbrella `opencode-cli`)
+          - \`opencode-<platform>-<arch>[-musl][-baseline](.tar.gz|.zip)\` — standalone CLI binaries
+          - \`dist/npm/*.tgz\` — npm packages (\`opencode-cli-*\` plus the umbrella \`opencode-cli\`)
 
-          macOS and Windows binaries are unsigned: after unpacking run `xattr -cr opencode` on
+          macOS and Windows binaries are unsigned: after unpacking run \`xattr -cr opencode\` on
           macOS, or confirm the SmartScreen prompt on Windows.
-          Stable asset URLs (`.../releases/download/aas-latest/opencode-linux-x64.tar.gz`) keep
-          working because every push to dev rewrote the same release.
           EOF
 
           if gh release view "$TAG" >/dev/null 2>&1; then
-            gh release delete "$TAG" --yes --cleanup-tag
+            gh release edit "$TAG" \
+              --title "opencode with Google AAS ($OPENCODE_VERSION)" \
+              --notes-file "$RUNNER_TEMP/notes.md"
+            gh release upload "$TAG" --clobber \
+              "$GITHUB_WORKSPACE/dist/archives/"* \
+              "$GITHUB_WORKSPACE/dist/npm/"*
+          else
+            gh release create "$TAG" \
+              --target "$GITHUB_SHA" \
+              --title "opencode with Google AAS ($OPENCODE_VERSION)" \
+              --notes-file "$RUNNER_TEMP/notes.md" \
+              "$GITHUB_WORKSPACE/dist/archives/"* \
+              "$GITHUB_WORKSPACE/dist/npm/"*
           fi
-          gh release create "$TAG" \
-            --target "$GITHUB_SHA" \
-            --title "opencode with Google AAS ($OPENCODE_VERSION)" \
-            --notes-file "$RUNNER_TEMP/notes.md" \
-            "$GITHUB_WORKSPACE/dist/archives/"* \
-            "$GITHUB_WORKSPACE/dist/npm/"*
